@@ -6,7 +6,6 @@ import { RECORD_TABLE_COLUMN_CHECKBOX_WIDTH_CLASS_NAME } from '@/object-record/r
 import { RECORD_TABLE_ROW_HEIGHT } from '@/object-record/record-table/constants/RecordTableRowHeight';
 import { useRecordTableBodyContextOrThrow } from '@/object-record/record-table/contexts/RecordTableBodyContext';
 import { RecordTableCellStyleWrapper } from '@/object-record/record-table/record-table-cell/components/RecordTableCellStyleWrapper';
-import { Checkbox } from 'twenty-ui/input';
 
 const StyledContainer = styled.div`
   align-items: center;
@@ -29,7 +28,10 @@ export const RecordTableCellCheckboxPlaceholder = () => {
       widthClassName={RECORD_TABLE_COLUMN_CHECKBOX_WIDTH_CLASS_NAME}
     >
       <StyledContainer data-select-disable>
-        <Checkbox hoverable checked={hasUserSelectedAllRows === true} />
+        {/* EXPERIMENT: skeleton rows rendered a live controlled checkbox
+            input. React's updateInput rewrites name (twice) and type on every
+            input on every commit, unconditionally, so 160 placeholder rows
+            cost ~960 no-op DOM attribute writes per interaction. */}
       </StyledContainer>
     </RecordTableCellStyleWrapper>
   );
