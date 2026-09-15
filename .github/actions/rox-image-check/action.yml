@@ -1,0 +1,142 @@
+name: StackRox image policy check (advisory)
+description: >
+  Run Central's policy engine against a pushed image and report violations.
+  ADVISORY ONLY — this action never fails the build.
+
+# WHY ADVISORY, AND WHAT THIS IS NOT:
+#
+# This does not overlap with the SBOM -> Dependency-Track path, and it is not a
+# CVE gate. StackRox Scanner V4 (ClairCore) has no Rust indexer and never reads
+# cargo-auditable's .dep-v0 section, so a Rust image's StackRox CVE count is
+# structurally 0 for application dependencies — that is DT's job. What Central
+# does own is the *policy* engine: image configuration hygiene (running as root,
+# package managers present, no health check, secrets in env, floating tags) plus
+# OS-package CVEs, where its distro data correctly accounts for Debian
+# backports that NVD's CPE matching does not.
+#
+# Measured on aishell-diode 2026-08-22: 1 LOW policy violation ("Ubuntu Package
+# Manager in Image"), 96 OS components, 0 *fixable* OS CVEs. So today this
+# reports rather than blocks, which is why it starts advisory. Tighten it to a
+# gate by configuring enforcement on the relevant Central policies first — a
+# `-D warnings`-style flip here without that would just be noise.
+#
+# See docs/research/CODE-INSPECTION.md (Tier 4) and fleet-infra docs/stackrox.md.
+
+inputs:
+  image:
+    description: "Fully-qualified image ref Central should evaluate (must already be pushed)"
+    required: true
+  api-token:
+    description: "StackRox API token. Use the built-in `Continuous Integration` role, not Admin."
+    required: true
+  endpoint:
+    description: >
+      Central endpoint. Defaults to the ingress hostname because it carries a
+      Let's Encrypt cert that validates against public trust, so no TLS
+      verification needs to be skipped. Do NOT switch this to the in-cluster
+      Service (central.stackrox.svc.cluster.local): Central's cert has no SAN
+      for that name, so it cannot be verified (measured from a runner pod:
+      ingress ssl_verify=0, Service ssl_verify=20 "unable to get local issuer
+      certificate"), and sending the API token over an unverified channel to
+      save a DNS lookup is a bad trade.
+    required: false
+    default: "stackrox.internal.carse.com:443"
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch roxctl from Central
+      shell: bash
+      env:
+        ROX_ENDPOINT: ${{ inputs.endpoint }}
+        ROX_API_TOKEN: ${{ inputs.api-token }}
+      run: |
+        # `set +e` is REQUIRED, not tidiness. GitHub runs composite `shell: bash`
+        # as `bash --noprofile --norc -e -o pipefail`, so errexit is ALREADY on
+        # and `set -uo pipefail` does not clear it. roxctl exits non-zero when it
+        # finds policy violations, so without this the step aborts the moment it
+        # does — discarding the summary and failing the job. Observed on
+        # aishell-ralph-worker (run 32603278967): 7m41s, exit 1, zero output.
+        set +e
+        set -uo pipefail
+        # Pull the CLI from Central itself rather than a release URL: the version
+        # is guaranteed to match the server, and it needs no egress (Central is
+        # in-cluster, so the perimeter ACL is not involved).
+        code=$(curl -sS -o "${RUNNER_TEMP}/roxctl" -w '%{http_code}' --max-time 180 \
+          -H "Authorization: Bearer ${ROX_API_TOKEN}" \
+          "https://${ROX_ENDPOINT%%:*}/api/cli/download/roxctl-linux-amd64")
+        if [ "$code" != "200" ] || [ ! -s "${RUNNER_TEMP}/roxctl" ]; then
+          echo "::warning::could not download roxctl from Central (HTTP $code) — skipping policy check"
+          exit 0
+        fi
+        chmod +x "${RUNNER_TEMP}/roxctl"
+        "${RUNNER_TEMP}/roxctl" version 2>/dev/null | head -1
+
+    - name: Policy check
+      shell: bash
+      env:
+        ROX_ENDPOINT: ${{ inputs.endpoint }}
+        ROX_API_TOKEN: ${{ inputs.api-token }}
+        IMAGE: ${{ inputs.image }}
+      run: |
+        # `set +e` is REQUIRED, not tidiness. GitHub runs composite `shell: bash`
+        # as `bash --noprofile --norc -e -o pipefail`, so errexit is ALREADY on
+        # and `set -uo pipefail` does not clear it. roxctl exits non-zero when it
+        # finds policy violations, so without this the step aborts the moment it
+        # does — discarding the summary and failing the job. Observed on
+        # aishell-ralph-worker (run 32603278967): 7m41s, exit 1, zero output.
+        set +e
+        set -uo pipefail
+        [ -x "${RUNNER_TEMP}/roxctl" ] || { echo "::warning::roxctl unavailable — skipped"; exit 0; }
+
+        # No --insecure-skip-tls-verify: the default endpoint's Let's Encrypt
+        # cert validates against the runner's system trust store. Keep it that
+        # way — the token is what travels over this connection.
+        "${RUNNER_TEMP}/roxctl" image check \
+          --image "${IMAGE}" \
+          --endpoint "${ROX_ENDPOINT}" \
+          --output json > "${RUNNER_TEMP}/rox.json" 2> "${RUNNER_TEMP}/rox.err"
+        rc=$?
+        if [ ! -s "${RUNNER_TEMP}/rox.json" ]; then
+          echo "::warning::roxctl produced no output (exit ${rc})"
+          head -c 400 "${RUNNER_TEMP}/rox.err" || true
+          exit 0
+        fi
+
+        python3 - <<'PY'
+        import json, os
+        p = os.path.join(os.environ["RUNNER_TEMP"], "rox.json")
+        img = os.environ["IMAGE"]
+        try:
+            d = json.load(open(p))
+        except Exception as e:
+            print(f"::warning::could not parse roxctl output: {e}")
+            raise SystemExit(0)
+
+        rows = []
+        for r in d.get("results") or []:
+            for v in r.get("violatedPolicies") or []:
+                rows.append((v.get("severity", "?"), v.get("name", "?"),
+                             (v.get("description") or "").strip()))
+        rank = {"CRITICAL_SEVERITY": 0, "HIGH_SEVERITY": 1, "MEDIUM_SEVERITY": 2, "LOW_SEVERITY": 3}
+        rows.sort(key=lambda x: rank.get(x[0], 9))
+
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        lines = [f"### StackRox policy check (advisory)", "", f"`{img}`", ""]
+        if not rows:
+            lines.append("No policy violations.")
+            print("::notice::StackRox: no policy violations")
+        else:
+            lines += ["| Severity | Policy |", "|---|---|"]
+            for sev, name, _ in rows:
+                lines.append(f"| {sev.replace('_SEVERITY','')} | {name} |")
+            worst = rows[0][0].replace("_SEVERITY", "")
+            print(f"::notice::StackRox: {len(rows)} policy violation(s), worst={worst} (advisory)")
+            for sev, name, _ in rows:
+                print(f"  [{sev.replace('_SEVERITY','')}] {name}")
+        lines += ["", "_Advisory only — does not fail the build. StackRox is blind to Rust "
+                  "dependencies by design; those are tracked in Dependency-Track._"]
+        if summary:
+            with open(summary, "a") as fh:
+                fh.write("\n".join(lines) + "\n")
+        PY

@@ -34,6 +34,8 @@ jobs:
     runs-on: docker-twenty-amd64
     permissions:
       contents: read
+    outputs:
+      build_tag: ${{ steps.prep.outputs.BUILD_TAG }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -97,3 +99,46 @@ jobs:
             echo "Overlaid onto \`twentycrm/twenty:${{ steps.prep.outputs.UPSTREAM }}\`."
             echo "Pin the immutable tag in fleet-infra \`apps/base/twenty/server.yaml\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # SBOM -> Dependency-Track. A separate job so a DT outage cannot fail a build
+  # that already pushed successfully.
+  sbom:
+    needs: build
+    runs-on: docker-twenty-amd64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log into Zot
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: zot.internal.flowbridge.net
+          username: ci
+          password: ${{ secrets.ZOT_PASSWORD }}
+
+      - name: SBOM -> Dependency-Track
+        uses: ./.github/actions/sbom-upload
+        with:
+          image: zot.internal.flowbridge.net/flowbridge/twenty:${{ needs.build.outputs.build_tag }}
+          project-name: twenty
+          project-version: ${{ needs.build.outputs.build_tag }}
+          project-tags: node,container,ci
+          api-key: ${{ secrets.DTRACK_API_KEY }}
+
+  # StackRox policy check. ADVISORY: continue-on-error, so neither a Central
+  # outage nor a newly added policy can fail a build that already pushed.
+  policy:
+    needs: build
+    continue-on-error: true
+    runs-on: docker-twenty-amd64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: StackRox policy check
+        uses: ./.github/actions/rox-image-check
+        with:
+          image: zot.internal.flowbridge.net/flowbridge/twenty:${{ needs.build.outputs.build_tag }}
+          api-token: ${{ secrets.ROX_API_TOKEN }}

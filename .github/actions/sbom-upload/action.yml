@@ -1,0 +1,104 @@
+name: SBOM → Dependency-Track
+description: >
+  Generate a CycloneDX SBOM for a pushed image with Syft and upload it to
+  Dependency-Track for continuous vulnerability re-evaluation.
+
+# WHY: the image is built FROM the upstream twentycrm/twenty release, so almost
+# all of its dependency surface is code we do not author and do not control.
+# Dependency-Track re-evaluates a stored SBOM against new advisories as they are
+# published, which is the only way we learn about a CVE in that base image
+# without rebuilding. Copied from FlowBridgeCom/aishell; keep them in sync.
+
+inputs:
+  image:
+    description: "Fully-qualified image ref to scan, e.g. ghcr.io/owner/aishell-diode:master-abc-123"
+    required: true
+  project-name:
+    description: "Dependency-Track project name (stable across builds, e.g. aishell-diode)"
+    required: true
+  project-version:
+    description: "Project version — use the build id so each build is its own version"
+    required: true
+  dtrack-url:
+    description: "Dependency-Track base URL"
+    required: false
+    default: "https://dtrack.internal.flowbridge.net"
+  api-key:
+    description: "Dependency-Track API key (Automation team; needs BOM_UPLOAD + PROJECT_CREATION_UPLOAD)"
+    required: true
+  project-tags:
+    description: "Comma-separated Dependency-Track project tags"
+    required: false
+    default: "container,ci"
+  syft-version:
+    description: "Pinned Syft version. Pinned deliberately — Syft is a supply-chain dependency of our supply-chain tooling."
+    required: false
+    default: "v1.51.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Syft
+      shell: bash
+      env:
+        SYFT_VERSION: ${{ inputs.syft-version }}
+      run: |
+        set -euo pipefail
+        curl -sSfL https://get.anchore.io/syft \
+          | sh -s -- -b "${RUNNER_TEMP}/bin" "${SYFT_VERSION}"
+        "${RUNNER_TEMP}/bin/syft" version | head -2
+
+    - name: Generate CycloneDX SBOM
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        # -o cyclonedx-json@1.6 is MANDATORY, not stylistic. Syft defaults to
+        # CycloneDX 1.7 since v1.46.0, and Dependency-Track 5.0.4 rejects 1.7
+        # with "400 Unrecognized specVersion 1.7" (1.7 support is milestone 5.1,
+        # not backported to 5.0.x). Revisit when DT reaches 5.1.
+        "${RUNNER_TEMP}/bin/syft" "${IMAGE}" -o cyclonedx-json@1.6 > "${RUNNER_TEMP}/sbom.cdx.json"
+
+        python3 - <<'PY'
+        import json, os
+        p = os.path.join(os.environ["RUNNER_TEMP"], "sbom.cdx.json")
+        d = json.load(open(p))
+        comps = d.get("components", [])
+        from collections import Counter
+        eco = Counter(str(c.get("purl", "")).split("/")[0] for c in comps if c.get("purl"))
+        top = ", ".join(f"{k}={v}" for k, v in eco.most_common(4))
+        print(f"specVersion={d.get('specVersion')} components={len(comps)} [{top}]")
+        assert d.get("specVersion") == "1.6", f"expected 1.6, got {d.get('specVersion')} — DT will 400"
+        assert comps, "SBOM has no components; refusing to upload an empty BOM"
+        PY
+
+    - name: Upload to Dependency-Track
+      shell: bash
+      env:
+        DT_URL: ${{ inputs.dtrack-url }}
+        DT_API_KEY: ${{ inputs.api-key }}
+        PROJECT_NAME: ${{ inputs.project-name }}
+        PROJECT_VERSION: ${{ inputs.project-version }}
+      run: |
+        set -euo pipefail
+        # POST is multipart and has no size limit (PUT caps at 20,000,000 chars).
+        # Sending JSON to POST returns 415 — let -F set the content type.
+        code=$(curl -sS -o "${RUNNER_TEMP}/dt.json" -w '%{http_code}' --max-time 180 \
+          -X POST "${DT_URL}/api/v1/bom" \
+          -H "X-Api-Key: ${DT_API_KEY}" \
+          -F "autoCreate=true" \
+          -F "projectName=${PROJECT_NAME}" \
+          -F "projectVersion=${PROJECT_VERSION}" \
+          -F "projectTags=${{ inputs.project-tags }}" \
+          -F "isLatest=true" \
+          -F "bom=@${RUNNER_TEMP}/sbom.cdx.json")
+
+        if [ "$code" != "200" ]; then
+          echo "::error::Dependency-Track upload failed (HTTP $code)"
+          # Body may name the missing permission, e.g. PROJECT_CREATION_UPLOAD.
+          head -c 400 "${RUNNER_TEMP}/dt.json" || true
+          exit 1
+        fi
+        echo "uploaded: $(head -c 200 "${RUNNER_TEMP}/dt.json")"
+        echo "::notice::SBOM uploaded to ${DT_URL} as ${PROJECT_NAME} ${PROJECT_VERSION}"
