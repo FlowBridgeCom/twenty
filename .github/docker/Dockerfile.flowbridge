@@ -57,6 +57,12 @@ RUN npx nx build twenty-front
 # ---------------------------------------------------------------------------
 FROM twentycrm/twenty:${UPSTREAM_VERSION} AS twenty-flowbridge
 
+# An ARG declared before the first FROM is only in scope for FROM lines. It has
+# to be restated inside the stage to be usable in a LABEL, or the build warns
+# "UndefinedVar: Usage of undefined variable '$UPSTREAM_VERSION'" and the label
+# is written empty.
+ARG UPSTREAM_VERSION
+
 USER root
 RUN rm -rf /app/packages/twenty-server/dist/front
 COPY --from=front-build --chown=1000:1000 /app/packages/twenty-front/build/ /app/packages/twenty-server/dist/front/
