@@ -1,0 +1,99 @@
+name: FlowBridge Image
+
+# Only our own branches and manual runs. Deliberately NO pull_request trigger:
+# this is a public fork of a widely-forked upstream repo, and the runners are
+# self-hosted inside our cluster -- a pull_request trigger would let anyone
+# execute code there.
+on:
+  push:
+    branches: [ 'flowbridge/**' ]
+    paths:
+      - 'packages/twenty-front/**'
+      - 'packages/twenty-ui/**'
+      - 'packages/twenty-shared/**'
+      - '.github/docker/Dockerfile.flowbridge'
+      - '.github/workflows/flowbridge-image.yml'
+  workflow_dispatch:
+    inputs:
+      upstream_version:
+        description: 'Upstream image tag to overlay onto (default: branch name)'
+        required: false
+
+# The frontend build is ~6 minutes and thrashes the shared buildx cache if two
+# run at once on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: zot.internal.flowbridge.net
+  IMAGE_NAME: flowbridge/twenty
+
+jobs:
+  build:
+    runs-on: docker-twenty-amd64
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Branch flowbridge/v2.40.2 -> upstream v2.40.2. The overlay base must be
+      # the upstream release the patches were rebased onto, so it is derived
+      # from the branch rather than hardcoded.
+      - name: Prepare tags
+        id: prep
+        run: |
+          set -euo pipefail
+          UPSTREAM="${{ github.event.inputs.upstream_version }}"
+          if [ -z "$UPSTREAM" ]; then UPSTREAM="${GITHUB_REF##*/}"; fi
+          case "$UPSTREAM" in
+            v[0-9]*) ;;
+            *) echo "::error::Cannot derive upstream version from '${GITHUB_REF}'. Pass upstream_version."; exit 1 ;;
+          esac
+          echo "UPSTREAM=${UPSTREAM}" >> "$GITHUB_OUTPUT"
+          echo "BUILD_TAG=${UPSTREAM}-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          echo "MOVING_TAG=${UPSTREAM}-latest" >> "$GITHUB_OUTPUT"
+          echo "Building ${UPSTREAM}-${GITHUB_SHA::8} onto twentycrm/twenty:${UPSTREAM}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log into Zot
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ci
+          password: ${{ secrets.ZOT_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: .github/docker/Dockerfile.flowbridge
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            UPSTREAM_VERSION=${{ steps.prep.outputs.UPSTREAM }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.BUILD_TAG }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.MOVING_TAG }}
+          provenance: false
+          # Best-effort layer cache. ignore-error so Zot being unavailable
+          # degrades to a slow build rather than a failed one.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/cache/twenty:amd64
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/cache/twenty:amd64,mode=max,ignore-error=true
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed"
+            echo ""
+            echo '```'
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.BUILD_TAG }}"
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.MOVING_TAG }}"
+            echo '```'
+            echo ""
+            echo "Overlaid onto \`twentycrm/twenty:${{ steps.prep.outputs.UPSTREAM }}\`."
+            echo "Pin the immutable tag in fleet-infra \`apps/base/twenty/server.yaml\`."
+          } >> "$GITHUB_STEP_SUMMARY"

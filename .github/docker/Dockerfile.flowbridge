@@ -1,0 +1,66 @@
+# FlowBridge build for self-hosted Twenty.
+#
+# Our patches are frontend-only, so this builds only the frontend from source
+# and overlays it onto the official upstream image. Every server byte therefore
+# stays identical to the upstream release, which keeps the diff auditable and
+# makes a rollback a one-line image change.
+#
+# The two front stages mirror packages/twenty-docker/twenty/Dockerfile. Check
+# them against upstream when rebasing onto a new release.
+
+ARG UPSTREAM_VERSION=v2.40.2
+
+# ---------------------------------------------------------------------------
+FROM node:24.19.0-alpine3.23@sha256:244cc2b53f46f9e876304391d17682b0ddae9ac33491f4857e25e35a36ba7995 AS front-deps
+
+WORKDIR /app
+
+COPY ./package.json ./yarn.lock ./.yarnrc.yml ./tsconfig.base.json ./nx.json /app/
+COPY ./.yarn/releases /app/.yarn/releases
+COPY ./.yarn/patches /app/.yarn/patches
+
+COPY ./packages/twenty-ui/package.json /app/packages/twenty-ui/
+COPY ./packages/twenty-shared/package.json /app/packages/twenty-shared/
+COPY ./packages/twenty-front/package.json /app/packages/twenty-front/
+COPY ./packages/twenty-front-component-renderer/package.json /app/packages/twenty-front-component-renderer/
+COPY ./packages/twenty-sdk/package.json /app/packages/twenty-sdk/
+COPY ./packages/twenty-client-sdk/package.json /app/packages/twenty-client-sdk/
+
+RUN yarn workspaces focus twenty twenty-front twenty-front-component-renderer twenty-ui twenty-shared twenty-sdk twenty-client-sdk \
+ && yarn cache clean && npx nx reset
+
+# ---------------------------------------------------------------------------
+FROM front-deps AS front-build
+
+COPY ./packages/twenty-front /app/packages/twenty-front
+COPY ./packages/twenty-front-component-renderer /app/packages/twenty-front-component-renderer
+COPY ./packages/twenty-ui /app/packages/twenty-ui
+COPY ./packages/twenty-shared /app/packages/twenty-shared
+COPY ./packages/twenty-sdk /app/packages/twenty-sdk
+COPY ./packages/twenty-client-sdk /app/packages/twenty-client-sdk
+
+# Hidden sourcemaps: the .map files ship but carry no sourceMappingURL, so
+# browsers never fetch them and users pay nothing. They exist so the next
+# performance investigation resolves real function names instead of minified
+# ones -- working out that `qne` was commitMutationEffectsOnFiber cost real
+# time on an unmapped build.
+ENV VITE_BUILD_SOURCEMAP=true
+
+# The ARC runner container is capped by the arc-runner-defaults LimitRange.
+# Keep the V8 heap under that ceiling or the build is OOM-killed with a bare
+# "exit code 137" and no error from vite.
+ENV NODE_OPTIONS=--max-old-space-size=7168
+
+RUN npx nx run twenty-front:lingui:extract && npx nx run twenty-front:lingui:compile
+RUN npx nx build twenty-front
+
+# ---------------------------------------------------------------------------
+FROM twentycrm/twenty:${UPSTREAM_VERSION} AS twenty-flowbridge
+
+USER root
+RUN rm -rf /app/packages/twenty-server/dist/front
+COPY --from=front-build --chown=1000:1000 /app/packages/twenty-front/build/ /app/packages/twenty-server/dist/front/
+USER 1000
+
+LABEL org.opencontainers.image.description="Twenty with FlowBridge frontend performance patches"
+LABEL com.flowbridge.upstream="twentycrm/twenty:${UPSTREAM_VERSION}"
